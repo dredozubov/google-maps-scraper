@@ -45,47 +45,55 @@ type S3Uploader interface {
 }
 
 type Config struct {
-	Concurrency              int
-	CacheDir                 string
-	MaxDepth                 int
-	InputFile                string
-	ResultsFile              string
-	JSON                     bool
-	LangCode                 string
-	Debug                    bool
-	Dsn                      string
-	ProduceOnly              bool
-	ExitOnInactivityDuration time.Duration
-	Email                    bool
-	CustomWriter             string
-	GeoCoordinates           string
-	Zoom                     int
-	RunMode                  int
-	DisableTelemetry         bool
-	WebRunner                bool
-	AwsLamdbaRunner          bool
-	DataFolder               string
-	Proxies                  []string
-	AwsAccessKey             string
-	AwsSecretKey             string
-	AwsRegion                string
-	S3Uploader               S3Uploader
-	S3Bucket                 string
-	AwsLambdaInvoker         bool
-	FunctionName             string
-	AwsLambdaChunkSize       int
-	FastMode                 bool
-	Radius                   float64
-	Addr                     string
-	DisablePageReuse         bool
-	ExtraReviews             bool
-	LeadsDBAPIKey            string
-	ExtraPhotos              bool
-	MaxRetries               int
-	RetryDelay               time.Duration
-	ProxyErrorsRetry         []string
-	ProxyRefreshInterval     time.Duration
-	ScrapoxyProxyURL         string
+	Concurrency                      int
+	CacheDir                         string
+	MaxDepth                         int
+	InputFile                        string
+	ResultsFile                      string
+	JSON                             bool
+	LangCode                         string
+	Debug                            bool
+	Dsn                              string
+	ProduceOnly                      bool
+	ExitOnInactivityDuration         time.Duration
+	Email                            bool
+	CustomWriter                     string
+	GeoCoordinates                   string
+	Zoom                             int
+	RunMode                          int
+	DisableTelemetry                 bool
+	WebRunner                        bool
+	AwsLamdbaRunner                  bool
+	DataFolder                       string
+	Proxies                          []string
+	AwsAccessKey                     string
+	AwsSecretKey                     string
+	AwsRegion                        string
+	S3Uploader                       S3Uploader
+	S3Bucket                         string
+	AwsLambdaInvoker                 bool
+	FunctionName                     string
+	AwsLambdaChunkSize               int
+	FastMode                         bool
+	Radius                           float64
+	Addr                             string
+	DisablePageReuse                 bool
+	ExtraReviews                     bool
+	LeadsDBAPIKey                    string
+	ExtraPhotos                      bool
+	MaxRetries                       int
+	RetryDelay                       time.Duration
+	ProxyErrorsRetry                 []string
+	ProxyRefreshInterval             time.Duration
+	ScrapoxyProxyURL                 string
+	ProxySelectionStrategy           string
+	ProxyValidationRate              float64
+	ProxyCooldownBase                time.Duration
+	ProxyCooldownMax                 time.Duration
+	ProxyReselectOnValidationFailure bool
+	ProxyReselectAttempts            int
+	ProxyRefreshOnFailure            bool
+	ProxyRefreshFailureThreshold     int
 }
 
 func ParseConfig() *Config {
@@ -153,6 +161,14 @@ func registerFlags(cfg *Config, proxies, proxyErrorsRetry *string) {
 	flag.DurationVar(&cfg.RetryDelay, "retry-delay", time.Second, "delay between retries on proxy errors")
 	flag.StringVar(proxyErrorsRetry, "proxy-errors-retry", "err_empty_response,err_tunnel_connection_failed,socket hang up", "comma separated list of proxy error substrings that trigger retry")
 	flag.DurationVar(&cfg.ProxyRefreshInterval, "proxy-refresh-interval", 5*time.Minute, "interval to refresh proxy list from SCRAPOXY_PROXY_URL (0 to disable)")
+	flag.StringVar(&cfg.ProxySelectionStrategy, "proxy-selection", "random", "proxy selection strategy: random, round_robin, least_failed")
+	flag.Float64Var(&cfg.ProxyValidationRate, "proxy-validation-rate", 0.2, "fraction of attempts to validate proxy connectivity (0-1)")
+	flag.DurationVar(&cfg.ProxyCooldownBase, "proxy-cooldown-base", 2*time.Second, "base cooldown after proxy failure")
+	flag.DurationVar(&cfg.ProxyCooldownMax, "proxy-cooldown-max", 2*time.Minute, "max cooldown after proxy failure")
+	flag.BoolVar(&cfg.ProxyReselectOnValidationFailure, "proxy-reselect-on-validation-failure", true, "reselect proxy when validation fails")
+	flag.IntVar(&cfg.ProxyReselectAttempts, "proxy-reselect-attempts", 2, "max reselections after proxy validation failure")
+	flag.BoolVar(&cfg.ProxyRefreshOnFailure, "proxy-refresh-on-failure", false, "refresh proxy list on repeated proxy failures")
+	flag.IntVar(&cfg.ProxyRefreshFailureThreshold, "proxy-refresh-failure-threshold", 10, "proxy failures before triggering on-demand refresh")
 }
 
 func applyAWSDefaults(cfg *Config) {
@@ -242,6 +258,37 @@ func validateConfig(cfg *Config) {
 
 	if cfg.Zoom < 0 || cfg.Zoom > 21 {
 		panic("Zoom must be between 0 and 21")
+	}
+
+	if cfg.ProxyValidationRate < 0 || cfg.ProxyValidationRate > 1 {
+		panic("ProxyValidationRate must be between 0 and 1")
+	}
+
+	strategy := strings.ToLower(cfg.ProxySelectionStrategy)
+	switch strategy {
+	case "random", "round_robin", "least_failed":
+	default:
+		panic("ProxySelectionStrategy must be one of: random, round_robin, least_failed")
+	}
+
+	if cfg.ProxyCooldownBase < 0 {
+		panic("ProxyCooldownBase must be >= 0")
+	}
+
+	if cfg.ProxyCooldownMax < 0 {
+		panic("ProxyCooldownMax must be >= 0")
+	}
+
+	if cfg.ProxyCooldownMax > 0 && cfg.ProxyCooldownBase > cfg.ProxyCooldownMax {
+		panic("ProxyCooldownBase must be <= ProxyCooldownMax")
+	}
+
+	if cfg.ProxyReselectAttempts < 0 {
+		panic("ProxyReselectAttempts must be >= 0")
+	}
+
+	if cfg.ProxyRefreshFailureThreshold < 0 {
+		panic("ProxyRefreshFailureThreshold must be >= 0")
 	}
 
 	if cfg.Dsn == "" && cfg.ProduceOnly {

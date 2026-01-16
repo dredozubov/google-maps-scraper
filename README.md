@@ -351,8 +351,16 @@ Database:
   -produce           Produce seed jobs only (requires -dsn)
 
 Proxy:
-  -proxies string    Comma-separated proxy list
-                     Format: protocol://user:pass@host:port
+  -proxies string                      Comma-separated proxy list
+                                       Format: protocol://user:pass@host:port
+  -proxy-selection string              Proxy selection strategy: random, round_robin, least_failed
+  -proxy-validation-rate float         Fraction of attempts to validate proxy connectivity (0-1)
+  -proxy-cooldown-base duration        Base cooldown after proxy failure
+  -proxy-cooldown-max duration         Max cooldown after proxy failure
+  -proxy-reselect-on-validation-failure bool  Reselect proxy when validation fails
+  -proxy-reselect-attempts int         Max reselections after proxy validation failure
+  -proxy-refresh-on-failure bool       Refresh proxy list on repeated proxy failures
+  -proxy-refresh-failure-threshold int Proxy failures before triggering on-demand refresh
 
 Export:
   -leadsdb-api-key   Export directly to LeadsDB (get key at getleadsdb.com)
@@ -385,6 +393,23 @@ To use a Scrapoxy rotating proxy endpoint, set `SCRAPOXY_PROXY_URL` and omit `-p
 ```bash
 export SCRAPOXY_PROXY_URL="http://project-user:project-pass@scrapoxy-host:8888"
 ./google-maps-scraper -input queries.txt -results results.csv -depth 1 -c 2
+```
+
+For higher concurrency and mixed proxy quality, enable on-demand refresh and adaptive selection:
+
+```bash
+export SCRAPOXY_PROXY_URL="http://project-user:project-pass@scrapoxy-host:8888"
+./google-maps-scraper \
+  -input queries.txt \
+  -results results.csv \
+  -depth 1 \
+  -c 20 \
+  -proxy-selection least_failed \
+  -proxy-validation-rate 0.25 \
+  -proxy-cooldown-base 2s \
+  -proxy-cooldown-max 2m \
+  -proxy-refresh-on-failure \
+  -proxy-refresh-failure-threshold 10
 ```
 
 **Supported protocols:** `socks5`, `socks5h`, `http`, `https`

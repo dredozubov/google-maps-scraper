@@ -35,9 +35,12 @@ type webrunner struct {
 	cfg *runner.Config
 	mu  sync.RWMutex
 
-	proxies         []string
-	proxySourceURL  string
-	refreshInterval time.Duration
+	proxies                 []string
+	proxySourceURL          string
+	refreshInterval         time.Duration
+	proxyManager            *proxyManager
+	proxyFailureCount       int
+	lastProxyRefreshAttempt time.Time
 }
 
 func New(cfg *runner.Config) (runner.Runner, error) {
@@ -78,6 +81,12 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 		}(),
 		proxySourceURL:  cfg.ScrapoxyProxyURL,
 		refreshInterval: cfg.ProxyRefreshInterval,
+		proxyManager: newProxyManager(proxyManagerConfig{
+			selectionStrategy: cfg.ProxySelectionStrategy,
+			validationRate:    cfg.ProxyValidationRate,
+			cooldownBase:      cfg.ProxyCooldownBase,
+			cooldownMax:       cfg.ProxyCooldownMax,
+		}),
 	}
 
 	return &ans, nil
@@ -191,15 +200,19 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 			}
 		}
 
-		err = w.runJobAttempt(ctx, job, outpath)
+		proxyUsed, err := w.runJobAttempt(ctx, job, outpath)
 		if err == nil {
+			w.proxyManager.MarkSuccess(proxyUsed)
 			job.Status = web.StatusOK
 			return w.svc.Update(ctx, job)
 		}
 
 		lastErr = err
 
-		if !isProxyRetryable(err, w.cfg.ProxyErrorsRetry) {
+		if isProxyRetryable(err, w.cfg.ProxyErrorsRetry) {
+			w.proxyManager.MarkFailure(proxyUsed)
+			w.maybeRefreshOnFailure(ctx)
+		} else {
 			break
 		}
 	}
@@ -214,7 +227,7 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 	return lastErr
 }
 
-func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Job) (*scrapemateapp.ScrapemateApp, error) {
+func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Job) (*scrapemateapp.ScrapemateApp, string, error) {
 	opts := []func(*scrapemateapp.Config) error{
 		scrapemateapp.WithConcurrency(w.cfg.Concurrency),
 		scrapemateapp.WithExitOnInactivity(time.Minute * 3),
@@ -230,16 +243,14 @@ func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Jo
 		)
 	}
 
-	proxies := w.currentProxies(job)
+	selectedProxy, err := w.pickProxyForJob(ctx, job)
+	if err != nil {
+		return nil, "", err
+	}
 
 	hasProxy := false
-
-	if len(proxies) > 0 {
-		if err := validateProxy(ctx, proxies[0]); err != nil {
-			return nil, fmt.Errorf("proxy validation failed: %w", err)
-		}
-
-		opts = append(opts, scrapemateapp.WithProxies(proxies))
+	if selectedProxy != "" {
+		opts = append(opts, scrapemateapp.WithProxies([]string{selectedProxy}))
 		hasProxy = true
 	}
 
@@ -261,10 +272,15 @@ func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Jo
 		opts...,
 	)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return scrapemateapp.NewScrapeMateApp(matecfg)
+	mate, err := scrapemateapp.NewScrapeMateApp(matecfg)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return mate, selectedProxy, nil
 }
 
 func (w *webrunner) refreshProxyLoop(ctx context.Context) error {
@@ -299,7 +315,11 @@ func (w *webrunner) refreshProxies(ctx context.Context) error {
 
 	w.mu.Lock()
 	w.proxies = proxies
+	w.proxyFailureCount = 0
+	w.lastProxyRefreshAttempt = time.Now()
 	w.mu.Unlock()
+
+	w.proxyManager.UpdateProxies(proxies)
 
 	log.Printf("refreshed proxy list: %d entries", len(proxies))
 
@@ -320,6 +340,80 @@ func (w *webrunner) currentProxies(job *web.Job) []string {
 	}
 
 	return nil
+}
+
+func (w *webrunner) pickProxyForJob(ctx context.Context, job *web.Job) (string, error) {
+	proxies := w.currentProxies(job)
+	if len(proxies) == 0 {
+		return "", nil
+	}
+
+	maxReselect := w.cfg.ProxyReselectAttempts
+	if !w.cfg.ProxyReselectOnValidationFailure {
+		maxReselect = 0
+	}
+
+	var lastErr error
+
+	for attempt := 0; attempt <= maxReselect; attempt++ {
+		selected := w.proxyManager.Select(proxies)
+		if selected == "" {
+			break
+		}
+
+		if !w.proxyManager.ShouldValidate() {
+			return selected, nil
+		}
+
+		if err := validateProxy(ctx, selected); err == nil {
+			return selected, nil
+		} else {
+			lastErr = err
+			w.proxyManager.MarkFailure(selected)
+			w.maybeRefreshOnFailure(ctx)
+		}
+
+		if attempt < maxReselect {
+			proxies = w.currentProxies(job)
+		}
+	}
+
+	if lastErr == nil {
+		return "", fmt.Errorf("%w: no proxy candidates available", errProxyValidationFailed)
+	}
+
+	return "", fmt.Errorf("%w: %v", errProxyValidationFailed, lastErr)
+}
+
+func (w *webrunner) maybeRefreshOnFailure(ctx context.Context) {
+	if !w.cfg.ProxyRefreshOnFailure || w.cfg.ProxyRefreshFailureThreshold <= 0 {
+		return
+	}
+
+	const proxyRefreshMinInterval = 30 * time.Second
+
+	shouldRefresh := false
+	now := time.Now()
+
+	w.mu.Lock()
+	w.proxyFailureCount++
+	lastAttempt := w.lastProxyRefreshAttempt
+	if lastAttempt.IsZero() {
+		lastAttempt = now.Add(-proxyRefreshMinInterval)
+	}
+
+	if w.proxyFailureCount >= w.cfg.ProxyRefreshFailureThreshold && now.Sub(lastAttempt) >= proxyRefreshMinInterval {
+		w.proxyFailureCount = 0
+		w.lastProxyRefreshAttempt = now
+		shouldRefresh = true
+	}
+	w.mu.Unlock()
+
+	if shouldRefresh {
+		if err := w.refreshProxies(ctx); err != nil {
+			log.Printf("proxy refresh failed: %v", err)
+		}
+	}
 }
 
 func fetchProxyList(ctx context.Context, sourceURL string) ([]string, error) {
@@ -401,19 +495,19 @@ func normalizeProxyList(proxies []string) []string {
 	return out
 }
 
-func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath string) error {
+func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath string) (string, error) {
 	outfile, err := os.Create(outpath)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	defer func() {
 		_ = outfile.Close()
 	}()
 
-	mate, err := w.setupMate(ctx, outfile, job)
+	mate, proxyUsed, err := w.setupMate(ctx, outfile, job)
 	if err != nil {
-		return err
+		return proxyUsed, err
 	}
 	defer mate.Close()
 
@@ -446,11 +540,11 @@ func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath str
 		w.cfg.ExtraPhotos,
 	)
 	if err != nil {
-		return err
+		return proxyUsed, err
 	}
 
 	if len(seedJobs) == 0 {
-		return nil
+		return proxyUsed, nil
 	}
 
 	exitMonitor.SetSeedCount(len(seedJobs))
@@ -476,15 +570,21 @@ func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath str
 
 	err = mate.Start(mateCtx, seedJobs...)
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		return err
+		return proxyUsed, err
 	}
 
-	return nil
+	return proxyUsed, nil
 }
+
+var errProxyValidationFailed = errors.New("proxy validation failed")
 
 func isProxyRetryable(err error, patterns []string) bool {
 	if err == nil || len(patterns) == 0 {
-		return false
+		return errors.Is(err, errProxyValidationFailed)
+	}
+
+	if errors.Is(err, errProxyValidationFailed) {
+		return true
 	}
 
 	msg := strings.ToLower(err.Error())
