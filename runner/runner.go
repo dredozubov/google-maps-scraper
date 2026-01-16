@@ -81,6 +81,9 @@ type Config struct {
 	ExtraReviews             bool
 	LeadsDBAPIKey            string
 	ExtraPhotos              bool
+	MaxRetries               int
+	RetryDelay               time.Duration
+	ProxyErrorsRetry         []string
 }
 
 func ParseConfig() *Config {
@@ -93,9 +96,24 @@ func ParseConfig() *Config {
 	}
 
 	var (
-		proxies string
+		proxies          string
+		proxyErrorsRetry string
 	)
 
+	registerFlags(&cfg, &proxies, &proxyErrorsRetry)
+
+	flag.Parse()
+
+	applyAWSDefaults(&cfg)
+	setProxyConfig(&cfg, proxies, proxyErrorsRetry)
+	setS3Uploader(&cfg)
+	validateConfig(&cfg)
+	setRunMode(&cfg)
+
+	return &cfg
+}
+
+func registerFlags(cfg *Config, proxies, proxyErrorsRetry *string) {
 	flag.IntVar(&cfg.Concurrency, "c", min(runtime.NumCPU()/2, 1), "sets the concurrency [default: half of CPU cores]")
 	flag.StringVar(&cfg.CacheDir, "cache", "cache", "sets the cache directory [no effect at the moment]")
 	flag.IntVar(&cfg.MaxDepth, "depth", 10, "maximum scroll depth in search results [default: 10]")
@@ -113,7 +131,7 @@ func ParseConfig() *Config {
 	flag.IntVar(&cfg.Zoom, "zoom", 15, "set zoom level (0-21) for search")
 	flag.BoolVar(&cfg.WebRunner, "web", false, "run web server instead of crawling")
 	flag.StringVar(&cfg.DataFolder, "data-folder", "webdata", "data folder for web runner")
-	flag.StringVar(&proxies, "proxies", "", "comma separated list of proxies to use in the format protocol://user:pass@host:port example: socks5://localhost:9050 or http://user:pass@localhost:9050")
+	flag.StringVar(proxies, "proxies", "", "comma separated list of proxies to use in the format protocol://user:pass@host:port example: socks5://localhost:9050 or http://user:pass@localhost:9050")
 	flag.BoolVar(&cfg.AwsLamdbaRunner, "aws-lambda", false, "run as AWS Lambda function")
 	flag.BoolVar(&cfg.AwsLambdaInvoker, "aws-lambda-invoker", false, "run as AWS Lambda invoker")
 	flag.StringVar(&cfg.FunctionName, "function-name", "", "AWS Lambda function name")
@@ -129,9 +147,12 @@ func ParseConfig() *Config {
 	flag.BoolVar(&cfg.ExtraReviews, "extra-reviews", false, "enable extra reviews collection")
 	flag.StringVar(&cfg.LeadsDBAPIKey, "leadsdb-api-key", "", "LeadsDB API key for exporting results to LeadsDB")
 	flag.BoolVar(&cfg.ExtraPhotos, "extra-photos", false, "enable extra photos collection (includes dates and individual photos)")
+	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "max retries on proxy errors")
+	flag.DurationVar(&cfg.RetryDelay, "retry-delay", time.Second, "delay between retries on proxy errors")
+	flag.StringVar(proxyErrorsRetry, "proxy-errors-retry", "err_empty_response,err_tunnel_connection_failed,socket hang up", "comma separated list of proxy error substrings that trigger retry")
+}
 
-	flag.Parse()
-
+func applyAWSDefaults(cfg *Config) {
 	if cfg.AwsAccessKey == "" {
 		cfg.AwsAccessKey = os.Getenv("MY_AWS_ACCESS_KEY")
 	}
@@ -143,7 +164,34 @@ func ParseConfig() *Config {
 	if cfg.AwsRegion == "" {
 		cfg.AwsRegion = os.Getenv("MY_AWS_REGION")
 	}
+}
 
+func setProxyConfig(cfg *Config, proxies, proxyErrorsRetry string) {
+	if proxies != "" {
+		cfg.Proxies = strings.Split(proxies, ",")
+	} else if scrapoxyProxy := os.Getenv("SCRAPOXY_PROXY_URL"); scrapoxyProxy != "" {
+		cfg.Proxies = strings.Split(scrapoxyProxy, ",")
+	}
+
+	if proxyErrorsRetry == "" {
+		return
+	}
+
+	for _, entry := range strings.Split(proxyErrorsRetry, ",") {
+		entry = strings.TrimSpace(strings.ToLower(entry))
+		if entry != "" {
+			cfg.ProxyErrorsRetry = append(cfg.ProxyErrorsRetry, entry)
+		}
+	}
+}
+
+func setS3Uploader(cfg *Config) {
+	if cfg.AwsAccessKey != "" && cfg.AwsSecretKey != "" && cfg.AwsRegion != "" {
+		cfg.S3Uploader = s3uploader.New(cfg.AwsAccessKey, cfg.AwsSecretKey, cfg.AwsRegion)
+	}
+}
+
+func validateConfig(cfg *Config) {
 	if cfg.AwsLambdaInvoker && cfg.FunctionName == "" {
 		panic("FunctionName must be provided when using AwsLambdaInvoker")
 	}
@@ -171,17 +219,9 @@ func ParseConfig() *Config {
 	if cfg.Dsn == "" && cfg.ProduceOnly {
 		panic("Dsn must be provided when using ProduceOnly")
 	}
+}
 
-	if proxies != "" {
-		cfg.Proxies = strings.Split(proxies, ",")
-	} else if scrapoxyProxy := os.Getenv("SCRAPOXY_PROXY_URL"); scrapoxyProxy != "" {
-		cfg.Proxies = strings.Split(scrapoxyProxy, ",")
-	}
-
-	if cfg.AwsAccessKey != "" && cfg.AwsSecretKey != "" && cfg.AwsRegion != "" {
-		cfg.S3Uploader = s3uploader.New(cfg.AwsAccessKey, cfg.AwsSecretKey, cfg.AwsRegion)
-	}
-
+func setRunMode(cfg *Config) {
 	switch {
 	case cfg.AwsLambdaInvoker:
 		cfg.RunMode = RunModeAwsLambdaInvoker
@@ -198,8 +238,6 @@ func ParseConfig() *Config {
 	default:
 		panic("Invalid configuration")
 	}
-
-	return &cfg
 }
 
 var (

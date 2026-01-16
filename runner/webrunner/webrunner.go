@@ -149,112 +149,47 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 	outpath := filepath.Join(w.cfg.DataFolder, job.ID+".csv")
 
-	outfile, err := os.Create(outpath)
-	if err != nil {
-		return err
+	maxRetries := w.cfg.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
 
-	defer func() {
-		_ = outfile.Close()
-	}()
+	var lastErr error
 
-	mate, err := w.setupMate(ctx, outfile, job)
-	if err != nil {
-		job.Status = web.StatusFailed
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("retrying job %s (attempt %d/%d) after error: %v", job.ID, attempt+1, maxRetries+1, lastErr)
 
-		err2 := w.svc.Update(ctx, job)
-		if err2 != nil {
-			log.Printf("failed to update job status: %v", err2)
-		}
-
-		return err
-	}
-
-	defer mate.Close()
-
-	var coords string
-	if job.Data.Lat != "" && job.Data.Lon != "" {
-		coords = job.Data.Lat + "," + job.Data.Lon
-	}
-
-	dedup := deduper.New()
-	exitMonitor := exiter.New()
-
-	seedJobs, err := runner.CreateSeedJobs(
-		job.Data.FastMode,
-		job.Data.Lang,
-		strings.NewReader(strings.Join(job.Data.Keywords, "\n")),
-		job.Data.Depth,
-		job.Data.Email,
-		coords,
-		job.Data.Zoom,
-		func() float64 {
-			if job.Data.Radius <= 0 {
-				return 10000 // 10 km
-			}
-
-			return float64(job.Data.Radius)
-		}(),
-		dedup,
-		exitMonitor,
-		w.cfg.ExtraReviews,
-		w.cfg.ExtraPhotos,
-	)
-	if err != nil {
-		job.Status = web.StatusFailed
-
-		err2 := w.svc.Update(ctx, job)
-		if err2 != nil {
-			log.Printf("failed to update job status: %v", err2)
-		}
-
-		return err
-	}
-
-	if len(seedJobs) > 0 {
-		exitMonitor.SetSeedCount(len(seedJobs))
-
-		allowedSeconds := max(60, len(seedJobs)*10*job.Data.Depth/50+120)
-
-		if job.Data.MaxTime > 0 {
-			if job.Data.MaxTime.Seconds() < 180 {
-				allowedSeconds = 180
-			} else {
-				allowedSeconds = int(job.Data.MaxTime.Seconds())
+			if w.cfg.RetryDelay > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(w.cfg.RetryDelay):
+				}
 			}
 		}
 
-		log.Printf("running job %s with %d seed jobs and %d allowed seconds", job.ID, len(seedJobs), allowedSeconds)
-
-		mateCtx, cancel := context.WithTimeout(ctx, time.Duration(allowedSeconds)*time.Second)
-		defer cancel()
-
-		exitMonitor.SetCancelFunc(cancel)
-
-		go exitMonitor.Run(mateCtx)
-
-		err = mate.Start(mateCtx, seedJobs...)
-		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			cancel()
-
-			job.Status = web.StatusFailed
-
-			err2 := w.svc.Update(ctx, job)
-			if err2 != nil {
-				log.Printf("failed to update job status: %v", err2)
-			}
-
-			return err
+		err = w.runJobAttempt(ctx, job, outpath)
+		if err == nil {
+			job.Status = web.StatusOK
+			return w.svc.Update(ctx, job)
 		}
 
-		cancel()
+		lastErr = err
+
+		if !isProxyRetryable(err, w.cfg.ProxyErrorsRetry) {
+			break
+		}
 	}
 
-	mate.Close()
+	job.Status = web.StatusFailed
 
-	job.Status = web.StatusOK
+	err2 := w.svc.Update(ctx, job)
+	if err2 != nil {
+		log.Printf("failed to update job status: %v", err2)
+	}
 
-	return w.svc.Update(ctx, job)
+	return lastErr
 }
 
 func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Job) (*scrapemateapp.ScrapemateApp, error) {
@@ -314,6 +249,107 @@ func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Jo
 	}
 
 	return scrapemateapp.NewScrapeMateApp(matecfg)
+}
+
+func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath string) error {
+	outfile, err := os.Create(outpath)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_ = outfile.Close()
+	}()
+
+	mate, err := w.setupMate(ctx, outfile, job)
+	if err != nil {
+		return err
+	}
+	defer mate.Close()
+
+	var coords string
+	if job.Data.Lat != "" && job.Data.Lon != "" {
+		coords = job.Data.Lat + "," + job.Data.Lon
+	}
+
+	dedup := deduper.New()
+	exitMonitor := exiter.New()
+
+	seedJobs, err := runner.CreateSeedJobs(
+		job.Data.FastMode,
+		job.Data.Lang,
+		strings.NewReader(strings.Join(job.Data.Keywords, "\n")),
+		job.Data.Depth,
+		job.Data.Email,
+		coords,
+		job.Data.Zoom,
+		func() float64 {
+			if job.Data.Radius <= 0 {
+				return 10000 // 10 km
+			}
+
+			return float64(job.Data.Radius)
+		}(),
+		dedup,
+		exitMonitor,
+		w.cfg.ExtraReviews,
+		w.cfg.ExtraPhotos,
+	)
+	if err != nil {
+		return err
+	}
+
+	if len(seedJobs) == 0 {
+		return nil
+	}
+
+	exitMonitor.SetSeedCount(len(seedJobs))
+
+	allowedSeconds := max(60, len(seedJobs)*10*job.Data.Depth/50+120)
+
+	if job.Data.MaxTime > 0 {
+		if job.Data.MaxTime.Seconds() < 180 {
+			allowedSeconds = 180
+		} else {
+			allowedSeconds = int(job.Data.MaxTime.Seconds())
+		}
+	}
+
+	log.Printf("running job %s with %d seed jobs and %d allowed seconds", job.ID, len(seedJobs), allowedSeconds)
+
+	mateCtx, cancel := context.WithTimeout(ctx, time.Duration(allowedSeconds)*time.Second)
+	defer cancel()
+
+	exitMonitor.SetCancelFunc(cancel)
+
+	go exitMonitor.Run(mateCtx)
+
+	err = mate.Start(mateCtx, seedJobs...)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+
+	return nil
+}
+
+func isProxyRetryable(err error, patterns []string) bool {
+	if err == nil || len(patterns) == 0 {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	for _, pattern := range patterns {
+		if pattern == "" {
+			continue
+		}
+
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateProxy(ctx context.Context, proxyURL string) error {
