@@ -3,6 +3,7 @@ package webrunner
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosom/google-maps-scraper/deduper"
@@ -31,6 +33,11 @@ type webrunner struct {
 	srv *web.Server
 	svc *web.Service
 	cfg *runner.Config
+	mu  sync.RWMutex
+
+	proxies         []string
+	proxySourceURL  string
+	refreshInterval time.Duration
 }
 
 func New(cfg *runner.Config) (runner.Runner, error) {
@@ -62,6 +69,15 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 		srv: srv,
 		svc: svc,
 		cfg: cfg,
+		proxies: func() []string {
+			if len(cfg.Proxies) == 0 {
+				return nil
+			}
+
+			return append([]string(nil), cfg.Proxies...)
+		}(),
+		proxySourceURL:  cfg.ScrapoxyProxyURL,
+		refreshInterval: cfg.ProxyRefreshInterval,
 	}
 
 	return &ans, nil
@@ -69,6 +85,12 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 
 func (w *webrunner) Run(ctx context.Context) error {
 	egroup, ctx := errgroup.WithContext(ctx)
+
+	if w.refreshInterval > 0 && w.proxySourceURL != "" {
+		egroup.Go(func() error {
+			return w.refreshProxyLoop(ctx)
+		})
+	}
 
 	egroup.Go(func() error {
 		return w.work(ctx)
@@ -208,13 +230,7 @@ func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Jo
 		)
 	}
 
-	var proxies []string
-
-	if len(w.cfg.Proxies) > 0 {
-		proxies = w.cfg.Proxies
-	} else if len(job.Data.Proxies) > 0 {
-		proxies = job.Data.Proxies
-	}
+	proxies := w.currentProxies(job)
 
 	hasProxy := false
 
@@ -249,6 +265,140 @@ func (w *webrunner) setupMate(ctx context.Context, writer io.Writer, job *web.Jo
 	}
 
 	return scrapemateapp.NewScrapeMateApp(matecfg)
+}
+
+func (w *webrunner) refreshProxyLoop(ctx context.Context) error {
+	if err := w.refreshProxies(ctx); err != nil {
+		log.Printf("proxy refresh failed: %v", err)
+	}
+
+	ticker := time.NewTicker(w.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := w.refreshProxies(ctx); err != nil {
+				log.Printf("proxy refresh failed: %v", err)
+			}
+		}
+	}
+}
+
+func (w *webrunner) refreshProxies(ctx context.Context) error {
+	proxies, err := fetchProxyList(ctx, w.proxySourceURL)
+	if err != nil {
+		return err
+	}
+
+	if len(proxies) == 0 {
+		return fmt.Errorf("proxy list is empty")
+	}
+
+	w.mu.Lock()
+	w.proxies = proxies
+	w.mu.Unlock()
+
+	log.Printf("refreshed proxy list: %d entries", len(proxies))
+
+	return nil
+}
+
+func (w *webrunner) currentProxies(job *web.Job) []string {
+	w.mu.RLock()
+	globalProxies := append([]string(nil), w.proxies...)
+	w.mu.RUnlock()
+
+	if len(globalProxies) > 0 {
+		return globalProxies
+	}
+
+	if len(job.Data.Proxies) > 0 {
+		return job.Data.Proxies
+	}
+
+	return nil
+}
+
+func fetchProxyList(ctx context.Context, sourceURL string) ([]string, error) {
+	if sourceURL == "" {
+		return nil, fmt.Errorf("proxy source URL is empty")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("proxy list returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	proxies, err := parseProxyList(body)
+	if err != nil {
+		return nil, err
+	}
+
+	return proxies, nil
+}
+
+func parseProxyList(body []byte) ([]string, error) {
+	if len(body) == 0 {
+		return nil, fmt.Errorf("proxy list response empty")
+	}
+
+	var parsed []string
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		return normalizeProxyList(parsed), nil
+	}
+
+	text := string(body)
+	proxies := normalizeProxyList(strings.FieldsFunc(text, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}))
+
+	if len(proxies) == 0 {
+		return nil, fmt.Errorf("proxy list response format unsupported")
+	}
+
+	return proxies, nil
+}
+
+func normalizeProxyList(proxies []string) []string {
+	if len(proxies) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(proxies))
+
+	for _, proxy := range proxies {
+		proxy = strings.TrimSpace(proxy)
+
+		if proxy == "" {
+			continue
+		}
+
+		out = append(out, proxy)
+	}
+
+	return out
 }
 
 func (w *webrunner) runJobAttempt(ctx context.Context, job *web.Job, outpath string) error {
