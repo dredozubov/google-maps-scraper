@@ -84,6 +84,8 @@ type Config struct {
 	MaxRetries               int
 	RetryDelay               time.Duration
 	ProxyErrorsRetry         []string
+	ProxyRefreshInterval     time.Duration
+	ScrapoxyProxyURL         string
 }
 
 func ParseConfig() *Config {
@@ -150,6 +152,7 @@ func registerFlags(cfg *Config, proxies, proxyErrorsRetry *string) {
 	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "max retries on proxy errors")
 	flag.DurationVar(&cfg.RetryDelay, "retry-delay", time.Second, "delay between retries on proxy errors")
 	flag.StringVar(proxyErrorsRetry, "proxy-errors-retry", "err_empty_response,err_tunnel_connection_failed,socket hang up", "comma separated list of proxy error substrings that trigger retry")
+	flag.DurationVar(&cfg.ProxyRefreshInterval, "proxy-refresh-interval", 5*time.Minute, "interval to refresh proxy list from SCRAPOXY_PROXY_URL (0 to disable)")
 }
 
 func applyAWSDefaults(cfg *Config) {
@@ -168,9 +171,10 @@ func applyAWSDefaults(cfg *Config) {
 
 func setProxyConfig(cfg *Config, proxies, proxyErrorsRetry string) {
 	if proxies != "" {
-		cfg.Proxies = strings.Split(proxies, ",")
+		cfg.Proxies = splitProxyList(proxies)
 	} else if scrapoxyProxy := os.Getenv("SCRAPOXY_PROXY_URL"); scrapoxyProxy != "" {
-		cfg.Proxies = strings.Split(scrapoxyProxy, ",")
+		cfg.ScrapoxyProxyURL = scrapoxyProxy
+		cfg.Proxies = splitProxyList(scrapoxyProxy)
 	}
 
 	if proxyErrorsRetry == "" {
@@ -183,6 +187,30 @@ func setProxyConfig(cfg *Config, proxies, proxyErrorsRetry string) {
 			cfg.ProxyErrorsRetry = append(cfg.ProxyErrorsRetry, entry)
 		}
 	}
+}
+
+func splitProxyList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+
+	out := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+
+		if part == "" {
+			continue
+		}
+
+		out = append(out, part)
+	}
+
+	return out
 }
 
 func setS3Uploader(cfg *Config) {
