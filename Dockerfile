@@ -1,13 +1,15 @@
 # Build stage for Playwright dependencies
 FROM ubuntu:20.04 AS playwright-deps
+ARG TARGETARCH
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
 #ENV PLAYWRIGHT_DRIVER_PATH=/opt/
 RUN export PATH=$PATH:/usr/local/go/bin:/root/go/bin \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl wget \
-    && wget -q https://go.dev/dl/go1.25.5.linux-amd64.tar.gz \
-    && tar -C /usr/local -xzf go1.25.5.linux-amd64.tar.gz \
-    && rm go1.25.5.linux-amd64.tar.gz \
+    && GO_ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "amd64") \
+    && wget -q https://go.dev/dl/go1.25.5.linux-${GO_ARCH}.tar.gz \
+    && tar -C /usr/local -xzf go1.25.5.linux-${GO_ARCH}.tar.gz \
+    && rm go1.25.5.linux-${GO_ARCH}.tar.gz \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
