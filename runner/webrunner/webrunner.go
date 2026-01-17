@@ -95,7 +95,11 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 func (w *webrunner) Run(ctx context.Context) error {
 	egroup, ctx := errgroup.WithContext(ctx)
 
-	if w.refreshInterval > 0 && w.proxySourceURL != "" {
+	// Only refresh if we have a dedicated list URL different from the proxy itself.
+	// Scrapoxy uses a single gateway model where the proxy URL IS the endpoint,
+	// not a URL that serves a list of proxies.
+	if w.refreshInterval > 0 && w.proxySourceURL != "" &&
+		(len(w.proxies) == 0 || w.proxySourceURL != w.proxies[0]) {
 		egroup.Go(func() error {
 			return w.refreshProxyLoop(ctx)
 		})
