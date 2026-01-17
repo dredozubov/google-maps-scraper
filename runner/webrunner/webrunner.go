@@ -206,6 +206,17 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 		proxyUsed, err := w.runJobAttempt(ctx, job, outpath)
 		if err == nil {
+			// Validate that results were actually produced
+			resultCount := countCSVRows(outpath)
+			if resultCount == 0 {
+				log.Printf("job %s produced 0 results, treating as failure for retry", job.ID)
+				lastErr = fmt.Errorf("job produced 0 results")
+				w.proxyManager.MarkFailure(proxyUsed)
+				w.maybeRefreshOnFailure(ctx)
+				continue
+			}
+
+			log.Printf("job %s completed with %d results", job.ID, resultCount)
 			w.proxyManager.MarkSuccess(proxyUsed)
 			job.Status = web.StatusOK
 			return w.svc.Update(ctx, job)
@@ -642,4 +653,32 @@ func validateProxy(ctx context.Context, proxyURL string) error {
 	}
 
 	return nil
+}
+
+// countCSVRows counts the number of data rows (excluding header) in a CSV file.
+// Returns 0 if the file doesn't exist, is empty, or has only a header row.
+func countCSVRows(filepath string) int {
+	f, err := os.Open(filepath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	rows := 0
+
+	for {
+		_, err := reader.Read()
+		if err != nil {
+			break
+		}
+		rows++
+	}
+
+	// Subtract 1 for header row, but don't go negative
+	if rows > 0 {
+		rows--
+	}
+
+	return rows
 }
